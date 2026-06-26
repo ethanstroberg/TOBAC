@@ -1,12 +1,13 @@
 '''
 SeedSig - Seeding Signature Automatic Identification and Tracking
 @author: ethan stroberg
-@date: 6/22/26
+@date: 6/25/26
 
 @version: 1.2
 - thresholds now based on positive dBZ anomalies
 - several new requirements added for feature tracking
 - drone seeding location and wind vector information now added
+- cone of allowance added
 '''
 #%%
 #imports, make sure everything we need is here
