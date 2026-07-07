@@ -3,7 +3,7 @@ SeedSig - Seeding Signature Automatic Identification and Tracking
 @author: ethan stroberg
 @date: 7/2/26
 
-@version: 1.4
+@version: 1.3.1
 1. code is now compartmentalized into functions for easier testing and debugging going forward
 2. case listing is now adaptive to what is in the RadarFiles folder
     a. subsequent branching is still hardcoded for now
