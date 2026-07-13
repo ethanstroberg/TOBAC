@@ -1,7 +1,7 @@
 '''
 SeedSig - Seeding Signature Automatic Identification and Tracking
 @author: ethan stroberg
-@date: 7/2/26
+@date: 7/7/26
 
 @version: 1.3.1
 1. code is now compartmentalized into functions for easier testing and debugging going forward
@@ -29,9 +29,9 @@ tp.quiet() # turn off trackpy warnings/messages
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from tqdm import tqdm
+from skimage.measure import find_contours
 import warnings
 warnings.filterwarnings("ignore")
-from skimage.measure import find_contours
 
 
 def selectCase():
@@ -64,7 +64,7 @@ def loadCaseConfig(caseName):
             "zgrid_limits": (0, 2500),
             "zgrid_shape": 6,
             "zslice": (0, 6),
-            "min_distance": 2000.0,
+            "min_distance": 5000.0,
             "sigma_threshold": 0.5,
             "grid_weighting_function": "Barnes2",
             "grid_roi_func": "constant",
@@ -125,7 +125,7 @@ def loadCaseConfig(caseName):
 
 
 
-def autoGridAxes(filenames, wind_location, radar, config): 
+def autoGridAxes(filenames, wind_location): 
     
     wspd_avg = wind_location["wspd_avg"]
     wdir_avg = wind_location["wdir_avg"]
@@ -168,7 +168,7 @@ def autoGridAxes(filenames, wind_location, radar, config):
         extra = (30000 - (ylim[1] - ylim[0])) / 2
         ylim = (ylim[0] - extra, ylim[1] + extra)
 
-    zlim = config["zgrid_limits"]
+    zlim = (0, 2500) # most things shouldn't go over 2500m?
 
     # Print with 2 decimal places using :.2f formatting
     print(
@@ -178,20 +178,12 @@ def autoGridAxes(filenames, wind_location, radar, config):
         f"  zlim = ({zlim[0]:.2f}, {zlim[1]:.2f})"
     )
 
+    # compute the diagonal of the grid
+    diagonal = np.sqrt((xlim[1] - xlim[0])**2 + (ylim[1] - ylim[0])**2)
+    print(f"grid diagonal = {diagonal:.2f} m")
+
 
     grid_limits = (zlim, ylim, xlim)
-
-    # choose the desired z grid spacing based on the z grid limits
-    # if zlim[1] - zlim[0] <= 500:
-    #     dz = 100
-    # elif zlim[1] - zlim[0] <= 1000 and zlim[1] - zlim[0] > 500:
-    #     dz = 200
-    # elif zlim[1] - zlim[0] <= 2000 and zlim[1] - zlim[0] > 1000:
-    #     dz = 300
-    # elif zlim[1] - zlim[0] < 2500 and zlim[1] - zlim[0] > 2000:
-    #     dz = 400
-    # else:
-    #     dz = 500
 
     dz=100
 
@@ -224,13 +216,14 @@ def autoGridAxes(filenames, wind_location, radar, config):
     box = {
         "grid_limits": grid_limits,
         "grid_shape": grid_shape,
+        "diagonal": diagonal
     }
 
     return box
 
 
 
-def processOneFile(filename, grid_shape, grid_limits, config):
+def processOneTilt(filename, grid_shape, grid_limits, config):
     radar = pyart.io.read_nexrad_archive(filename) # read in the radar file once
 
     # apply the default filter in-place to avoid re-reading the file
@@ -250,32 +243,47 @@ def processOneFile(filename, grid_shape, grid_limits, config):
         replace_existing=True,
     )
 
-    grid = pyart.map.grid_from_radars(
-            radar, 
-            grid_shape=grid_shape, 
-            grid_limits=grid_limits,
-            fields = ['reflectivity_filtered'],
-            weighting_function=config["grid_weighting_function"], # Barnes2 is the one that makes paintballs, Nearest looks like high res grid radar
-            roi_func = config["grid_roi_func"],
-            constant_roi = config["grid_constant_roi"], # meters
-            gridding_algo='map_gates_to_grid')
-    
-    refl = grid.fields["reflectivity_filtered"]["data"].filled(np.nan) # fill masked values with NaN
-    scantime = pd.to_datetime(radar.time["units"].split("since ")[1])
+    sweep_results = []
 
-    return (refl, scantime, grid.x["data"], grid.y["data"], grid.z["data"])
+    unique_angles, unique_indices = np.unique(radar.fixed_angle['data'], return_index=True)
+    sweeps = unique_indices[:6]
+
+    for sweep in sweeps: # could do range(radar.nsweeps) if you want all of them
+        sweep_radar = radar.extract_sweeps([sweep])
+
+        grid = pyart.map.grid_from_radars(
+                sweep_radar, 
+                grid_shape=grid_shape, 
+                grid_limits=grid_limits,
+                fields = ['reflectivity_filtered'],
+                weighting_function=config["grid_weighting_function"], # Barnes2 is the one that makes paintballs, Nearest looks like high res grid radar
+                roi_func = config["grid_roi_func"],
+                constant_roi = config["grid_constant_roi"], # meters
+                gridding_algo='map_gates_to_grid')
+    
+        #refl = grid.fields["reflectivity_filtered"]["data"][0].filled(np.nan) # fill masked values with NaN
+        #sweep_results.append(refl)
+        grid_data = grid.fields["reflectivity_filtered"]["data"].filled(np.nan)
+        refl_2d = np.ma.getdata(np.nanmax(grid_data, axis=0))
+        refl_2d = np.where(np.isnan(refl_2d), np.nan, refl_2d)
+        sweep_results.append(refl_2d)
+
+
+    scantime = pd.to_datetime(radar.time["units"].split("since ")[1])
+    selected_elevations = radar.fixed_angle["data"][sweeps]
+
+    return (sweep_results, scantime, grid.x["data"], grid.y["data"], selected_elevations)
 
 
 
 def loadGridRadar(filenames, config, box):
 
-    # TODO: change these to come from autoGridAxes data
+    # these come from autoGridAxes data
     grid_limits = box["grid_limits"]
     grid_shape = box["grid_shape"]
-    zslice = config["zslice"]  # (box["sweeps"][0], box["sweeps"][-1] + 1)
 
     worker = partial(
-        processOneFile,
+        processOneTilt,
         grid_shape=grid_shape,
         grid_limits=grid_limits,
         config=config
@@ -290,20 +298,14 @@ def loadGridRadar(filenames, config, box):
                 )
         )
 
-    gridded_refl = [r[0] for r in results] # list of gridded reflectivity arrays
     scans = [r[1] for r in results] # list of scan times
 
     x = results[0][2] # x coordinates of the grid
     y = results[0][3] # y coordinates of the grid
-    z = results[0][4] # z coordinates of the grid
+    elevations = results[0][4] # list of elevations for each sweep
 
-    all_refl = np.stack(gridded_refl, axis=0) # stack the gridded reflectivity data into a single array
-    print(f"shape of full reflectivity array: {all_refl.shape}") # check the shape of the full reflectivity array
-    # all_refl has dimensions (time, z, y, x)
-
-    dxy = x[1] - x[0] # calculate grid spacing in meters
-    print(f"grid spacing = {dxy}m")
-    print()
+    num_sweeps = len(results[0][0]) # number of sweeps per radar file
+    sweep_data = {}
 
     # Convert timezone-aware pandas Timestamps to timezone-naive numpy.datetime64
     scans = (
@@ -312,22 +314,30 @@ def loadGridRadar(filenames, config, box):
         .to_numpy(dtype="datetime64[ns]")
     )
 
-    # build the xarray DataArray
-    da = xr.DataArray(
-        all_refl,
-        dims=("time", "z", "y", "x"),
-        coords={
-            "time": scans,
-            "z": z,
-            "y": y,
-            "x": x,
-        },
-        name="reflectivity"
-    )                                            
+    for sweep in range(num_sweeps):
+        sweep_stack = np.stack(
+            [result[0][sweep] for result in results],
+            axis=0
+        )
 
-    da_track = da.isel(z=slice(*zslice)).max(dim="z")
+        elevation = float(elevations[sweep])
+        sweep_data[elevation] = xr.DataArray(
+            sweep_stack,
+            dims=("time", "y", "x"),
+            coords={
+                "time": scans,
+                "y": y,
+                "x": x
+            },
+            name=f"sweep_{elevation:.2f}º",
+        )
 
-    return da_track, dxy
+
+    dxy = x[1] - x[0] # calculate grid spacing in meters
+    print(f"grid spacing = {dxy}m")
+    print()
+
+    return sweep_data, dxy, elevations
 
 
 
@@ -454,7 +464,7 @@ def trackFeatures(da_track, features, dxy, config):
         "subnetwork_size": 30,
         "memory": memory, # how long a feature can disappear for before we stop trying to link it to a track
     }
-
+    
     # tracks is also a pandas dataframe
     tracks = tobac.linking_trackpy(
         features,
@@ -489,14 +499,10 @@ def filterTracks(stats, tracks, config, radar, ymdt, wind_location):
     peak_ref = tracks.groupby("cell")["reflectivity"].max()
     good_ref = peak_ref[peak_ref >= required_ref].index
 
-    # at its peak reflectivity, the plume must have at least 10 pixels above required_ref
-    # required_min_peak_pixels = 0
-    # idx_peak = tracks.groupby("cell")["reflectivity"].idxmax()
-    # peaks = tracks.loc[idx_peak]
-    # good_peak_pixels = peaks.loc[peaks["num"] >= required_min_peak_pixels, "cell"]
-
+    # fourth, we only want to allow tracks that start within the cone of allowance
     good_cells_cone, cartesian_drone_coords = buildCone(tracks, wind_location)
     
+    # merge all the filtering criteria together to get the final list of good cells
     good_cells = good_frames.intersection(good_displacement).intersection(good_ref).intersection(good_cells_cone)
     tracks_filtered = tracks[tracks["cell"].isin(good_cells)]
 
@@ -695,7 +701,8 @@ def buildCone(tracks, wind_location):
 
 
 
-def animateTracks(da_track, tracks_filtered, cartesian_drone_coords, ymdt, mask_filtered):
+def animateTracks(results, cartesian_drone_coords, ymdt):
+    # drone and cone coordinates
     x_site = cartesian_drone_coords["x_site"]
     y_site = cartesian_drone_coords["y_site"]
     x_left = cartesian_drone_coords["x_left"]
@@ -703,150 +710,266 @@ def animateTracks(da_track, tracks_filtered, cartesian_drone_coords, ymdt, mask_
     x_right = cartesian_drone_coords["x_right"]
     y_right = cartesian_drone_coords["y_right"]
 
+    # set the common grid for all plots using the first sweep
+    first_result = next(iter(results.values()))
+    first_da = first_result["data"]
 
-    # create the figure
-    fig, ax = plt.subplots(figsize=(8, 6))
+    xmin_km = first_da.x.values.min() / 1000.0
+    xmax_km = first_da.x.values.max() / 1000.0
+    ymin_km = first_da.y.values.min() / 1000.0
+    ymax_km = first_da.y.values.max() / 1000.0
 
-    # use imshow for faster frame updates; set extent from grid coords (convert to km)
-    xmin_km = da_track.x.values.min() / 1000.0
-    xmax_km = da_track.x.values.max() / 1000.0
-    ymin_km = da_track.y.values.min() / 1000.0
-    ymax_km = da_track.y.values.max() / 1000.0
+    nframes = len(first_da.time)
 
-    im = ax.imshow(
-        da_track.isel(time=0),
-        origin="lower",
-        extent=(xmin_km, xmax_km, ymin_km, ymax_km),
-        cmap="NWSRef",
-        vmin=-20,
-        vmax=70,
-        aspect="auto",
-    )
+    # create the 2x3 subplot
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True, sharey=True, constrained_layout=True)
+    axes = axes.flatten()
 
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("dBZ")
+    # create a dict to store everything associated with one subplot
+    plots = {}
 
-    ax.set_xlabel("Distance from Radar (km)")
-    ax.set_ylabel("Distance from Radar (km)")
-    ax.set_xlim(xmin_km, xmax_km)
-    ax.set_ylim(ymin_km, ymax_km)
-    ax.autoscale(False) # so the cone can't mess with it
+    # create shared_image and initialize to none
+    shared_image = None
 
-    # pre-create line artists for each track to avoid re-plotting every frame
-    track_ids = sorted(tracks_filtered["cell"].unique())
-    line_artists = {}
-    for track_id in track_ids:
-        ln, = ax.plot([], [], "-o", label=f"Track {track_id}")
-        line_artists[track_id] = ln
+    # create each subplot
 
-    # scatter artist for tracked features at the current frame
-    scatter_artist = ax.scatter([], [], c="black", marker="x", s=100, label="Feature")
+    for ax, (elev, result) in zip(axes, results.items()):
+        da_track = result["data"]
+        tracks_filtered = result["tracks_filtered"]
 
-    # plot radar location if inside bounds
-    radar_marker = None
-    if (0 >= xmin_km) and (0 <= xmax_km) and (0 >= ymin_km) and (0 <= ymax_km):
-        radar_marker, = ax.plot(0, 0, marker="o", color="k", markersize=12, label="Radar")
+        image = ax.imshow(
+            da_track.isel(time=0),
+            origin="lower",
+            extent=(xmin_km, xmax_km, ymin_km, ymax_km),
+            cmap="NWSRef",
+            vmin=-20,
+            vmax=70,
+            aspect="auto",
+        )
 
-    # plot drone seeding location
-    drone_marker, = ax.plot(x_site / 1000.0, y_site / 1000.0, marker="s", color="k", markersize=8, label="Drone")
+        # save the first image to make a shared colorbar after the loop
+        if shared_image is None:
+            shared_image = image
+        
+        ax.set_xlim(xmin_km, xmax_km)
+        ax.set_ylim(ymin_km, ymax_km)
+        ax.set_xlabel("Distance from Radar (km)")
+        ax.set_ylabel("Distance from Radar (km)")
+        ax.autoscale(False)  # so the cone can't mess with it
 
-    # plot the cone of allowance
-    ax.plot(
-        [x_site / 1000.0, x_left / 1000.0],
-        [y_site / 1000.0, y_left / 1000.0],
-        "k--",
-        lw=2
-    )
-    ax.plot(
-        [x_site / 1000.0, x_right / 1000.0],
-        [y_site / 1000.0, y_right / 1000.0],
-        "k--",
-        lw=2
-    )
+        # plot radar location if inside bounds
+        radar_marker = None
+        if (0 >= xmin_km) and (0 <= xmax_km) and (0 >= ymin_km) and (0 <= ymax_km):
+            radar_marker = ax.plot(0, 0, marker="o", color="k", markersize=12, label="Radar")
 
-    ax.fill(
-        [x_site / 1000.0, x_left / 1000.0, x_right / 1000.0],
-        [y_site / 1000.0, y_left / 1000.0, y_right / 1000.0],
-        alpha=0.15,
-        clip_on=True
-    )
+        # plot drone seeding location
+        drone_marker = ax.plot(x_site / 1000.0, y_site / 1000.0, marker="s", color="k", markersize=8, label="Drone")
 
-    ax.legend(loc="upper left")
+        # plot the cone of allowance
+        ax.plot(
+            [x_site / 1000.0, x_left / 1000.0],
+            [y_site / 1000.0, y_left / 1000.0],
+            "k--",
+            lw=2
+        )
+        ax.plot(
+            [x_site / 1000.0, x_right / 1000.0],
+            [y_site / 1000.0, y_right / 1000.0],
+            "k--",
+            lw=2
+        )
 
-    seg_lines = []
+        ax.fill(
+            [x_site / 1000.0, x_left / 1000.0, x_right / 1000.0],
+            [y_site / 1000.0, y_left / 1000.0, y_right / 1000.0],
+            alpha=0.15,
+            clip_on=True
+        )
 
-    def update(frame): # nested function to update the plot for each frame
-        # update the image
-        im.set_data(da_track.isel(time=frame))
+        # scatter artist for tracked features at the current frame
+        scatter = ax.scatter([], [], c="black", marker="x", s=100, label="Feature")
 
-        for line in seg_lines:
-            line.remove()
-        seg_lines.clear()
+        # line artists for plotting tracks
+        line_artists = {}
 
-        mask = mask_filtered.isel(time=frame).values
+        for track_id in sorted(tracks_filtered["cell"].unique()):
+            line, = ax.plot([], [], "-o", label=f"Track {track_id}")
+            line_artists[track_id] = line
 
-        for feature_id in np.unique(mask):
-            if feature_id == 0:
-                continue # skip background
+        # store all of these things in plots for animation
+        plots[elev] = {
+            "ax": ax,
+            "image": image,
+            "scatter": scatter,
+            "line_artists": line_artists,
+            "segment_lines": [],
+            "da_track": da_track,
+            "tracks_filtered": tracks_filtered,
+            "mask_filtered": result["mask"]
+        }
 
-            contours = find_contours(mask == feature_id, 0.5)
+        ax.set_title(f"{elev:.2f}º")
 
-            for contour in contours:
-                # contour[:,0] = row (y index)
-                # contour[:,1] = column (x index)
+        ax.legend(fontsize=7, loc="upper left")
 
-                y = np.interp(
-                    contour[:, 0],
-                    np.arange(mask.shape[0]),
-                    da_track.y.values / 1000,
-                )
+    # create colorbar for all subplots using the shared image
+    cbar = fig.colorbar(shared_image, ax=axes, location="right", shrink=0.95, pad=0.02)
+    cbar.set_label("Reflectivity (dBZ)")
 
-                x = np.interp(
-                    contour[:, 1],
-                    np.arange(mask.shape[1]),
-                    da_track.x.values / 1000,
-                )
+    # get rid of any plots with nothing in case there are less than 6 tilts
+    for ax in axes[len(results):]:
+        ax.axis("off")
 
-                line, = ax.plot(
-                    x,
-                    y,
-                    color="black",
-                    linewidth=2,
-                    zorder=20,
-                )
+    def update(frame):
+        for elev, plot in plots.items():
 
-                seg_lines.append(line)
-                
+            ax = plot["ax"]
+            da_track = plot["da_track"]
+            tracks_filtered = plot["tracks_filtered"]
+            mask_filtered = plot["mask_filtered"]
+            image = plot["image"]
+            scatter = plot["scatter"]
+            track_lines = plot["line_artists"]
+            segment_lines = plot["segment_lines"]
 
+            # update the reflectivity image
+            image.set_data(da_track.isel(time=frame))
 
-        # update each track line to only include points up to the current frame
-        for track_id, ln in line_artists.items():
-            tr = tracks_filtered[(tracks_filtered["cell"] == track_id) & (tracks_filtered["frame"] <= frame)]
-            if not tr.empty:
-                ln.set_data(tr["x"].values / 1000.0, tr["y"].values / 1000.0)
+            # remove old segments
+            for line in segment_lines:
+                line.remove()
+            segment_lines.clear()
+
+            # draw new segment contours
+            mask = mask_filtered.isel(time=frame).values
+            feature_ids = np.unique(mask)
+            
+            for feature_id in feature_ids:
+                if feature_id == 0:
+                    continue  # skip background
+
+                contours = find_contours(mask == feature_id, 0.5)
+
+                for contour in contours:
+                    y = np.interp(
+                        contour[:, 0],
+                        np.arange(mask.shape[0]),
+                        da_track.y.values / 1000,
+                    )
+                    x = np.interp(
+                        contour[:, 1],
+                        np.arange(mask.shape[1]),
+                        da_track.x.values / 1000,
+                    )
+
+                    line, = ax.plot(
+                        x,
+                        y,
+                        color="black",
+                        linewidth=2,
+                        zorder=20,
+                    )
+                    segment_lines.append(line)
+
+            # update each track line to only include points up to the current frame
+            for track_id, line in track_lines.items():
+                tr = tracks_filtered[
+                    (tracks_filtered["cell"] == track_id) &
+                    (tracks_filtered["frame"] <= frame)
+                ]
+
+                if not tr.empty:
+                    line.set_data(
+                        tr["x"].values / 1000.0,
+                        tr["y"].values / 1000.0
+                    )
+
+                else:
+                    line.set_data([], [])
+            
+            # update feature markers
+            current = tracks_filtered[tracks_filtered["frame"] == frame]
+            if not current.empty:
+                offsets = np.column_stack((current["x"].values / 1000.0, current["y"].values / 1000.0))
+                scatter.set_offsets(offsets)
             else:
-                ln.set_data([], [])
+                scatter.set_offsets(np.empty((0, 2)))
 
-        # update scatter for tracked features at this frame
-        tracked_features = tracks_filtered[tracks_filtered["frame"] == frame]
-        if not tracked_features.empty:
-            offsets = np.c_[tracked_features["x"].values / 1000.0, tracked_features["y"].values / 1000.0]
-            scatter_artist.set_offsets(offsets)
-        else:
-            scatter_artist.set_offsets(np.empty((0, 2)))
+            # update title
+            timestamp = pd.to_datetime(first_da.time.values[frame]).strftime('%Y-%m-%d %H:%M:%SZ')
+            fig.suptitle(f"Reflectivity Seeding Signatures {timestamp}", fontsize=16)
+            ax.set_title(f"{elev:.2f}º")
 
-        ax.set_title(f"Reflectivity Seeding Signature Tracks\n{pd.to_datetime(da_track.time.values[frame]).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        # return artists for blitting NOTE figure out what blitting is, if not done get rid of this block
+        artists = []
+        for plot in plots.values():
+            artists.append(plot["image"])
+            artists.append(plot["scatter"])
+            artists.extend(plot["line_artists"].values())
+            artists.extend(plot["segment_lines"])
 
-    ani = FuncAnimation(fig, update, frames=len(da_track.time), repeat=False)
+            return artists
+        
+    # create animation
+    ani = FuncAnimation(fig, update, frames=nframes, repeat=False)
     ani.save(f"/Users/ethan1/Desktop/vs_code/Rainmaker/Animations/{ymdt}_AnomRef.gif", writer=PillowWriter(fps=2), dpi=300)
 
-    plt.close()
+    plt.close(fig)
 
 
 
-def saveOutput(df, title, ymdt):
-    # save features to a csv
-    df.to_csv(f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/{ymdt}_{title}.csv", index=False)
+def saveOutput(df, title, ymdt): #NOTE returns for now, will fix once sweeps are working
+    # save features to a csv 
+    #df.to_csv(f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/{ymdt}_{title}.csv", index=False)
+    return
+
+
+
+def saveTuningData(stats, box, wind_location, config, ymdt):
+    # take all background/env stats and put them in a df to save so we can analyze the differences more easily
+    row = {
+        "datetime": str(ymdt),
+        "median_background_noise": stats["median_background_noise"],
+        "mean_background_noise": stats["mean_background_noise"],
+        "std_dev": stats["std_dev"],
+        "iqr": stats["iqr"],
+        "percent_covered": stats["percent_covered"],
+        "ref_thresholds": str(stats["ref_thresholds"]),
+        "x_min": box["grid_limits"][2][0],
+        "x_max": box["grid_limits"][2][1],
+        "y_min": box["grid_limits"][1][0],
+        "y_max": box["grid_limits"][1][1],
+        "z_min": box["grid_limits"][0][0],
+        "z_max": box["grid_limits"][0][1],
+        "grid_diagonal": box["diagonal"],
+        "xshape": box["grid_shape"][2],
+        "yshape": box["grid_shape"][1],
+        "zshape": box["grid_shape"][0],
+        "wspd_avg": wind_location["wspd_avg"],
+        "wdir_avg": wind_location["wdir_avg"],
+        "segmentation_threshold": config["segmentation_threshold"],
+        "sigma_threshold": config["sigma_threshold"],
+        "min_distance": config["min_distance"],
+    }
+
+    csv_path = f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/tuning_data.csv"
+    
+    row_df = pd.DataFrame([row])
+
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path, dtype={"datetime": str})
+    else:
+        df = pd.DataFrame()
+
+    # Remove any previous row for this datetime
+    df = df[df["datetime"] != row["datetime"]]
+
+    # Add the new row
+    df = pd.concat([df, row_df], ignore_index=True)
+
+    # Sort and save
+    df.sort_values("datetime", inplace=True)
+    df.to_csv(csv_path, index=False)
 
 
 
@@ -858,28 +981,58 @@ def main():
 
     wind_location = droneLocation_windVector(config, radar)
     
-    box = autoGridAxes(filenames, wind_location, radar, config)
+    box = autoGridAxes(filenames, wind_location)
 
-    da_track, dxy = loadGridRadar(filenames, config, box)
+    sweep_data, dxy, elevations = loadGridRadar(filenames, config, box)
 
-    ymdt = pd.to_datetime(da_track.time.values[0]).strftime("%Y%m%d_%H%M%SZ")
+    results = {} # dict to hold our analysis below
 
-    stats = computeThresholds(da_track)
+    for elevation, da in sweep_data.items():
+        print(f"Processing {elevation:.2f}º sweep")
 
-    features = detectFeatures(da_track, dxy, stats, config, ymdt)
+        stats = computeThresholds(da) 
 
-    tracks = trackFeatures(da_track, features, dxy, config)
+        ymdt = pd.to_datetime(da.time.values[0]).strftime("%Y%m%d_%H%M%SZ")
 
-    tracks_filtered, cartesian_drone_coords = filterTracks(stats, tracks, config, radar, ymdt, wind_location)
+        #saveTuningData(stats, box, wind_location, config, ymdt)
 
-    mask, features_mask = segmentFeatures(da_track, tracks_filtered, dxy, config)
-    # filter the segmentation mask to match tracked features only so we only are including signatures we want
-    # good_features = set(tracks_filtered["feature"])
-    # mask_filtered = mask.copy()
-    # mask_filtered = mask_filtered.where(np.isin(mask_filtered, list(good_features)), other=0)
-    
+        features = detectFeatures(da, dxy, stats, config, ymdt)
 
-    animateTracks(da_track, tracks_filtered, cartesian_drone_coords, ymdt, mask)
+        if features.empty:
+            print(f"Skipping {elevation:.2f}º due to no features detected\n")
+
+            throwaway, cartesian_drone_coords = buildCone(pd.DataFrame(columns=["cell", "frame", "x", "y"]), wind_location)
+
+            results[elevation] = {
+                "data": da,
+                "stats": stats,
+                "features": features,
+                "tracks": pd.DataFrame(columns=["cell", "frame", "x", "y"]),
+                "tracks_filtered": pd.DataFrame(columns=["cell", "frame", "x", "y"]),
+                "mask": xr.zeros_like(da),
+                "features_mask": None
+            }
+
+            continue
+
+        tracks = trackFeatures(da, features, dxy, config)
+
+        tracks_filtered, cartesian_drone_coords = filterTracks(stats, tracks, config, radar, ymdt, wind_location)
+
+        mask, features_mask = segmentFeatures(da, tracks_filtered, dxy, config)
+
+        results[elevation] = {
+            "data": da,
+            "stats": stats,
+            "features": features,
+            "tracks": tracks,
+            "tracks_filtered": tracks_filtered,
+            "mask": mask,
+            "features_mask": features_mask
+        }
+
+
+    animateTracks(results, cartesian_drone_coords, ymdt)
 
 
 
