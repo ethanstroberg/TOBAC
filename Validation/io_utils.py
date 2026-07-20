@@ -33,7 +33,7 @@ def load_case_config(caseName):
 
 
 
-def merge_metadata(df, results, config):
+def merge_metadata(df, results, stats):
     # add metadata to the df so all variables live in one place
     df = df.copy()
 
@@ -55,8 +55,8 @@ def merge_metadata(df, results, config):
         df.loc[mask, "iqr"] = stats["iqr"]
         df.loc[mask, "percent_covered"] = stats["percent_covered"]
 
-    df["sigma_threshold"] = config["sigma_threshold"]
-    df["segmentation_threshold"] = config["segmentation_threshold"]
+    df["sigma_threshold"] = stats["sigma_threshold"]
+    df["segmentation_threshold"] = stats["segmentation_threshold"]
 
     return df
 

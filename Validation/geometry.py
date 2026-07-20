@@ -2,6 +2,8 @@
 coordinate grids, dynamic bounting, geometric calculations
 """
 
+import site
+
 import numpy as np
 import pandas as pd
 import os
@@ -123,12 +125,12 @@ def get_wind(df):
 
     for index, row in df.iterrows():
         
-        if pd.isna(row.iloc[5]) or pd.isna(row.iloc[6]):
-            wspd = row.iloc[7]  # Original 24
-            wdir = row.iloc[8]  # Original 25
+        if pd.isna(row.iloc[6]) or pd.isna(row.iloc[7]):
+            wspd = row.iloc[8]  # Original 24
+            wdir = row.iloc[9]  # Original 25
         else:
-            wspd = row.iloc[5]  # Original 17
-            wdir = row.iloc[6]  # Original 18
+            wspd = row.iloc[6]  # Original 17
+            wdir = row.iloc[7]  # Original 18
 
         wspd_list.append(wspd)
         wdir_list.append(wdir)
@@ -170,27 +172,35 @@ def drone_location_wind_vector(config, radar):
 
     df = pd.read_csv(flight_data)
 
-    # cols we're interested in: 0 (date), 1(seeding start time), 5 (drone #), 24 (median drone wspd), 25 (median drone wdir), 26/27 (stdev wspd / wdir)
-    cols = [0, 1, 5, 15, 16, 17, 18, 24, 25] # 17, 18 are closest sounding wspd and wdir, use these if they exist, otherwise use drone data 24, 25
+    # cols we're interested in: 0 (date), 1(seeding start time), 3 (site name), 5 (drone #), 24 (median drone wspd), 25 (median drone wdir), 26/27 (stdev wspd / wdir)
+    cols = [0, 1, 3, 5, 15, 16, 17, 18, 24, 25] # 17, 18 are closest sounding wspd and wdir, use these if they exist, otherwise use drone data 24, 25
 
     drone_df = df.iloc[:, cols] # keep all rows for now, keep only relevant cols
 
     # save the cleaned up drone data to a csv to make our life easier if we want to look at it
-    df.to_csv(f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/drone_data_master.csv", index=False)
+    drone_df.to_csv(f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/drone_data_master.csv", index=False)
 
     # until automation is added, branching statements to choose the right rows
     # we will lock on to the site butter or cabin, easier when there's multiple drones right next to each other all launched from the same site
     sites = {
-        "butter": (45.50800, -119.01300),
-        "cabin": (45.76400, -118.28100)
+        ""
+        "Butter": (45.50800, -119.01300),
+        "Cabin": (45.76400, -118.28100),
+        "Toast": (45.433, -118.834)
     }
 
     wspd_list = []
     wdir_list = []
 
-    x_site, y_site = get_site_location(sites[config["site"]], radar)
-    drone_df = drone_df.iloc[config["rows"], :]
+    drone_df = drone_df.iloc[config["rows"], :] # narrow down to only the case-specific rows
+    
+    # obtain the site name from the df, they SHOULD all be the same most of the time, but in case they aren't, take the more common one under the assumption they are close together
+    site = drone_df.iloc[:, 2].mode().iloc[0] # get the mode of the site names
+    print("site: ", site)
+
+    # get the wind and drone info
     wspd_list, wdir_list = get_wind(drone_df)
+    x_site, y_site = get_site_location(sites[site], radar)
 
     print(f"radar relative site location: x = {x_site:.2f} m, y = {y_site:.2f} m")
 
@@ -205,12 +215,60 @@ def drone_location_wind_vector(config, radar):
         print(f"wspd: {wspd_list[i]} m/s, wdir: {wdir_list[i]}º")
     print(f"avg wspd: {wspd_avg:.2f} m/s, avg wdir: {wdir_avg:.2f}º")
 
-    wind_location = {
+    # also pull the seeding time(s) from the dataframe
+    seeding_date_time = drone_df.iloc[:, [0, 1]]
+    dtimes = pd.to_datetime(seeding_date_time.iloc[:, 0].astype(str) + " " + seeding_date_time.iloc[:, 1].astype(str))
+
+    wind_location_time = {
         "wspd_avg": wspd_avg,
         "wdir_avg": wdir_avg,
         "x_site": x_site,
-        "y_site": y_site
+        "y_site": y_site,
+        "seeding_times": dtimes
     }
 
-    return wind_location
+    return wind_location_time
 
+
+
+def build_cone_only(wind_location):
+
+    wspd_avg = wind_location["wspd_avg"]
+    wdir_avg = wind_location["wdir_avg"]
+    x_site = wind_location["x_site"]
+    y_site = wind_location["y_site"]
+
+    # a plume will show up within 45 mins usually, set a max distance
+    max_dist = wspd_avg * 2400 # max allowed dist of cone in meters --> speed (m/s) * time (s) = distance (m)
+    half_angle = 25 # deg to each side of the mean wdir
+    downwind_angle = (wdir_avg + 180) % 360 # we need downwind so we can use our side angle
+    theta = np.radians(90 - downwind_angle) # this is the mathematical angle, not meteorological
+
+    left_theta = np.radians(90 - (downwind_angle - half_angle))
+    right_theta = np.radians(90 - (downwind_angle + half_angle))
+    
+    x_left = x_site + max_dist * np.cos(left_theta)
+    y_left = y_site + max_dist * np.sin(left_theta)
+    x_right = x_site + max_dist * np.cos(right_theta)
+    y_right = y_site + max_dist * np.sin(right_theta)
+
+    # unit vector pointing downwind
+    u = np.cos(theta)
+    v = np.sin(theta)
+    wind_vec = np.array([u, v])
+
+    cartesian_drone_coords = {
+        "x_site": x_site,
+        "y_site": y_site,
+        "x_left": x_left,
+        "y_left": y_left,
+        "x_right": x_right,
+        "y_right": y_right
+    }
+
+    print(f"max distance of cone = {max_dist:.2f} m")
+    print(f"half angle set to {half_angle}º, downwind angle = {downwind_angle:.2f}º")
+    print(f"mathematical theta = {np.degrees(theta):.2f}º")
+    print()
+
+    return cartesian_drone_coords
