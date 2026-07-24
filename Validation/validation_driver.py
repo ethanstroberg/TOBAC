@@ -1,7 +1,7 @@
 """
 main driver for automatic radar validation of cloud seeding signatures
 @author: Ethan Stroberg
-@date: 7/14/26
+@date: 7/22/26
 """
 
 # import support .py files
@@ -36,8 +36,6 @@ def main():
 
     sweep_data, dxy, elevations = load_grid_radar(filenames, box)
 
-    drone_coords = build_cone_only(wind_location_time)
-
     results = {}
 
     for elevation, da in sweep_data.items():
@@ -65,25 +63,20 @@ def main():
             }
 
             continue
-        # NOTE this section is altered currently to test TINT as the tracking algorithm
-        # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        mask, features_mask = tr.segment_features(da, features, dxy, stats) # NOTE changed param 2 from tracks_filtered to features ... also swapped tracking and segmentation
-        
-        tracks = tr.track_features(da, features_mask, dxy, stats)
+
+        tracks = tr.track_features(da, features, dxy, stats, wind_location_time)
 
         tracks_filtered, cartesian_drone_coords = tr.filter_tracks(stats, tracks, wind_location_time)
 
-        good_cell_ids = tracks_filtered["feature"].unique()
+        mask, features_mask = tr.segment_features(da, tracks_filtered, dxy, stats)
 
-        clean_mask = mask.where(mask.isin(good_cell_ids), 0)
-        # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         results[elevation] = {
             "data": da,
             "stats": stats,
             "features": features,
             "tracks": tracks,
             "tracks_filtered": tracks_filtered,
-            "mask": clean_mask,
+            "mask": mask,
             "features_mask": features_mask
         }
     
@@ -98,6 +91,9 @@ def main():
     seg_df.insert(0, "height", seg_df.pop("height"))
 
     seg_df = merge_metadata(seg_df, results, config)
+
+    stats = tr.get_bulk_statistics(seg_df, results, dxy)
+    tr.save_output(stats.round(3), "case_stats", ymdt)
     
     tr.save_output(features_df, "featuresID", ymdt)
     tr.save_output(tracks_filtered_df, "tracksID", ymdt)

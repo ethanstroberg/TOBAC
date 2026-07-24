@@ -4,12 +4,14 @@ all TOBAC related processing plus initial statistics/threshold computing
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 import tobac 
 import trackpy as tp
 tp.quiet() # turn off trackpy warnings/messages
-from scipy.ndimage import median_filter
+from tobac.utils import get_statistics_from_mask
 import warnings
 warnings.filterwarnings("ignore")
+
 
 def compute_thresholds(da_track):
 
@@ -90,8 +92,8 @@ def detect_features(da_track, dxy, stats):
 
     # set up the parameters for feature detection
     parameters_features = {
-        "position_threshold": "weighted_diff", # four options here, center, extreme, weighted_diff, and abs_diff. tobac recommends weighted or abs
-        "min_distance": 5000, # meters, min required difference between features. if two features are closer than this, the one with the more extreme value is kept
+        "position_threshold": "weighted_diff", # four options here, center, extreme, weighted_diff, and weighted_abs. tobac recommends weighted or abs
+        "min_distance": 10000, # meters, min required difference between features. if two features are closer than this, the one with the more extreme value is kept
         "sigma_threshold": sigma_threshold, # gaussian smoothing parameter (scipy.ndimage.gaussian_filter)
         "n_erosion_threshold": 1, # reduces the size of a feature in all direcitons (skimage.morphology.binary_erosion)
         "n_min_threshold": 3, # min number of pixels required for a feature to be detected
@@ -139,7 +141,7 @@ def segment_features(da_track, features, dxy, stats):
 
 
 
-def track_features(da_track, features, dxy, stats):
+def track_features(da_track, features, dxy, stats, wind_location_time):
 
     # calculate the median time step... they are all nearly the same so this is ok
     # we just need to be able to find velocity so tobac can track speed
@@ -150,7 +152,7 @@ def track_features(da_track, features, dxy, stats):
         # preferred fast path using numpy datetime64 array
         dt = float(np.median(np.diff(times.values) / np.timedelta64(1, "s")))
     except Exception:
-        # fallback to pandas Timedelta median
+        # fallback to pandas timedelta median
         dt = float(pd.Series(times).diff().median() / np.timedelta64(1, "s"))
 
     # set up the parameters for tracking in time and space
@@ -164,6 +166,7 @@ def track_features(da_track, features, dxy, stats):
         "memory": stats["memory"], # how long a feature can disappear for before we stop trying to link it to a track
         "stubs": 3 # minimum timesteps for a tracked cell to be reported
     }
+
     
     # tracks is also a pandas dataframe
     tracks = tobac.linking_trackpy(
@@ -171,7 +174,7 @@ def track_features(da_track, features, dxy, stats):
         None,
         dt=dt,
         dxy=dxy,
-        v_max= 15.0, # maximum velocity in m/s
+        v_max= 11.0, # maximum velocity in m/s
         **parameters_tracking,
     )
 
@@ -196,11 +199,8 @@ def filter_tracks(stats, tracks, wind_location_time):
     # third, we only want to allow tracks that start within the cone of allowance
     good_cells_cone, cartesian_drone_coords = build_cone(tracks, wind_location_time)
 
-    # fourth, we want to remove tracks with extreme horizontal deviations from typical plume motion
-    good_angles = compare_angles(tracks)
-
     # merge all the filtering criteria together to get the final list of good cells
-    good_cells = good_displacement.intersection(good_ref).intersection(good_cells_cone)#.intersection(good_angles)
+    good_cells = good_displacement.intersection(good_ref).intersection(good_cells_cone)
     tracks_filtered = tracks[tracks["cell"].isin(good_cells)]
 
     # output the filtered tracks to a csv so we can look at exact points and track them better
@@ -284,7 +284,6 @@ def build_cone(tracks, wind_location):
 
 
 
-
 def save_output(df, title, ymdt):
     # save features to a csv 
     df.to_csv(f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/{ymdt}_{title}.csv", index=False)
@@ -292,43 +291,123 @@ def save_output(df, title, ymdt):
 
 
 
-def compare_angles(tracks, max_turn = 45): #NOTE under construction / in development
-    # compare the angle of motion between each point along a track and the previous point
-    # identify and remove tracks that have extreme changes in direction inconsistent with typical plume motion
-
-    good_cells = []
-
-    for cell, track in tracks.groupby("cell"):
-        track = track.sort_values("time")
-
-        dx = np.diff(track["x"].to_numpy())
-        dy = np.diff(track["y"].to_numpy())
-
-        if len(dx) < 2:
+def get_bulk_statistics(df, results, dxy):
+    '''compute various statistics on the tracked segments'''
+    # we need the mask from results for QPE: apply the Z-R relationship to each pixel in the
+    # full segmented plume footprint for each feature (instead of just the pixel used to ID it),
+    # then aggregate the per-pixel rain rates directly, so the nonlinear Z-R transform is never
+    # applied to an already-averaged Z (which would bias the result, per Jensen's inequality)
+    df_with_plume_r = []
+    for elevation, result in results.items():
+        elevation_df = df[df["height"] == elevation]
+        if elevation_df.empty:
             continue
 
-        keep = True
+        df_with_plume_r.append(
+            get_statistics_from_mask(
+                elevation_df,
+                result["mask"],
+                result["data"], # this is the reflectivity array
+                statistic={
+                    "plume_mean_r": lambda vals: np.mean((10 ** (vals / 10) / 200) ** (1 / 1.6)),
+                    "plume_sum_r": lambda vals: np.sum((10 ** (vals / 10) / 200) ** (1 / 1.6)),
+                },
+                id_column="feature",
+            )
+        )
 
-        
+    df = pd.concat(df_with_plume_r, ignore_index=True)
 
-        
+    stats = df.groupby(["height", "cell"]).apply(lambda group: _group_stats(group, dxy)).reset_index()
 
-    return pd.Index(good_cells)
-
-
+    return stats
 
 
 
-    # fourth (building on the cone) we want tracks that start within an apprpopriate amount of time from the seeding time
-    # times = wind_location_time["seeding_times"] # pandas timestamps <class 'pandas._libs.tslibs.timestamps.Timestamp'>
-    # # if the start time for a track is more than 45 minutes AFTER one of the seeding times, reject it
-    # max_delay = pd.Timedelta(minutes=45)
-    # track_init = tracks.groupby("cell")["time"].min()
+def _group_stats(group, dxy):
+    motion_speed_ms, motion_dir_deg = _compute_motion_vector(group)
 
-    # valid_init_windows = [(seed_time, seed_time + max_delay) for seed_time in times]
+    # every statistic that we want to compute
+    return pd.Series({
+        "mean_dbz": group["reflectivity"].mean(),
+        "std_dbz": group["reflectivity"].std(),
+        "median_dbz": group["reflectivity"].median(),
+        "max_dbz": group["reflectivity"].max(),
+        "min_dbz": group["reflectivity"].min(),
+        "max_px": group["ncells"].max(skipna=True),
+        "min_px": group["ncells"].min(skipna=True),
+        "avg_px": group["ncells"].mean(skipna=True),
+        "max_area (km^2)": group["ncells"].max(skipna=True) * (dxy ** 2) / 1e6,
+        "min_area (km^2)": group["ncells"].min(skipna=True) * (dxy ** 2) / 1e6,
+        "avg_area (km^2)": group["ncells"].mean(skipna=True) * (dxy ** 2) / 1e6,
+        "QPE accumulation (mm)": _compute_qpe(group["plume_mean_r"], group["time"]),
+        "total vol precip (m^3)": _compute_integrated_volume(group["plume_sum_r"], group["time"], dxy),
+        "avg speed (m/s)": motion_speed_ms,
+        "avg dir (deg from N)": motion_dir_deg, # cardinal convention, 0/360º = due north, 90º = due east etc
+    })
 
-    # good_times = []
 
-    # for cell, start_time in track_init.items():
-    #     if any(start <= start_time <= end for start, end in valid_init_windows):
-    #         good_times.append(cell)
+
+def _compute_motion_vector(group):
+    '''average the per-frame velocity vectors (dx/dt, dy/dt) across the track to get a mean
+    motion vector, then convert to speed (m/s) and meteorological direction (deg, 0/360 = North,
+    increasing clockwise). averaging the u/v components -- rather than averaging speed and
+    direction separately -- avoids wraparound issues when a track's heading crosses due north,
+    and is more robust to noise than just using the start/end points'''
+    order = group["time"].sort_values().index
+    x = group["x"].loc[order]
+    y = group["y"].loc[order]
+    time = group["time"].loc[order]
+
+    dt = time.diff().dt.total_seconds()
+    dx = x.diff()
+    dy = y.diff()
+
+    valid = dt > 0
+    u = dx[valid] / dt[valid]
+    v = dy[valid] / dt[valid]
+
+    if u.empty:
+        return np.nan, np.nan
+
+    mean_u = u.mean()
+    mean_v = v.mean()
+
+    speed = float(np.sqrt(mean_u ** 2 + mean_v ** 2))
+    direction = float(np.degrees(np.arctan2(mean_u, mean_v)) % 360)
+
+    return speed, direction
+
+
+
+def _compute_qpe(mean_r, time):
+    '''take time and the per-pixel-averaged rain rate (Z-R relationship already applied per
+    pixel before averaging) and integrate over time to get accumulated depth in mm'''
+    order = time.sort_values().index
+
+    R = mean_r.loc[order]  # mm/hr, mean of per-pixel rain rates
+
+    # get the dt in hours
+    dt = (
+        time.loc[order].diff().dt.total_seconds().fillna(0) / 3600
+    )
+    # integrate
+    return np.sum(R * dt)
+
+
+
+def _compute_integrated_volume(sum_r, time, dxy):
+    '''take time and the per-pixel-summed rain rate (Z-R relationship already applied per
+    pixel before summing) to compute the total precipitation volume swept out by the
+    segment over its whole lifetime, accumulated pixel-by-pixel'''
+    order = time.sort_values().index
+    time_sorted = time.loc[order]
+
+    R_sum = sum_r.loc[order]  # mm/hr, sum of per-pixel rain rates across the footprint
+
+    dt = time_sorted.diff().dt.total_seconds() / 3600
+    dt.iloc[0] = 0  # no previous time point for the first entry
+
+    depth_sum_m = (R_sum * dt) / 1000  # sum over pixels of accumulated depth per timestep, m
+
+    return float((depth_sum_m * dxy ** 2).sum())  # each pixel has area dxy^2

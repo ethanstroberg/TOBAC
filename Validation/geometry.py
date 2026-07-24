@@ -2,8 +2,6 @@
 coordinate grids, dynamic bounting, geometric calculations
 """
 
-import site
-
 import numpy as np
 import pandas as pd
 import os
@@ -52,7 +50,7 @@ def auto_grid_axes(filenames, wind_location):
         extra = (30000 - (ylim[1] - ylim[0])) / 2
         ylim = (ylim[0] - extra, ylim[1] + extra)
 
-    zlim = (500, 2000) # most things shouldn't go over 5000m at the far end of the sixth sweep height
+    zlim = (500, 2000) # we want to cover the 500-2000m zone with out CAPPIs
 
     # Print with 2 decimal places using :.2f formatting
     print(
@@ -180,10 +178,9 @@ def drone_location_wind_vector(config, radar):
     # save the cleaned up drone data to a csv to make our life easier if we want to look at it
     drone_df.to_csv(f"/Users/ethan1/Desktop/vs_code/Rainmaker/AnalysisData/drone_data_master.csv", index=False)
 
-    # until automation is added, branching statements to choose the right rows
+    # for now, we will choose the site based on the rows chosen from the csv that are listed in the config file
     # we will lock on to the site butter or cabin, easier when there's multiple drones right next to each other all launched from the same site
     sites = {
-        ""
         "Butter": (45.50800, -119.01300),
         "Cabin": (45.76400, -118.28100),
         "Toast": (45.433, -118.834)
@@ -228,47 +225,3 @@ def drone_location_wind_vector(config, radar):
     }
 
     return wind_location_time
-
-
-
-def build_cone_only(wind_location):
-
-    wspd_avg = wind_location["wspd_avg"]
-    wdir_avg = wind_location["wdir_avg"]
-    x_site = wind_location["x_site"]
-    y_site = wind_location["y_site"]
-
-    # a plume will show up within 45 mins usually, set a max distance
-    max_dist = wspd_avg * 2400 # max allowed dist of cone in meters --> speed (m/s) * time (s) = distance (m)
-    half_angle = 25 # deg to each side of the mean wdir
-    downwind_angle = (wdir_avg + 180) % 360 # we need downwind so we can use our side angle
-    theta = np.radians(90 - downwind_angle) # this is the mathematical angle, not meteorological
-
-    left_theta = np.radians(90 - (downwind_angle - half_angle))
-    right_theta = np.radians(90 - (downwind_angle + half_angle))
-    
-    x_left = x_site + max_dist * np.cos(left_theta)
-    y_left = y_site + max_dist * np.sin(left_theta)
-    x_right = x_site + max_dist * np.cos(right_theta)
-    y_right = y_site + max_dist * np.sin(right_theta)
-
-    # unit vector pointing downwind
-    u = np.cos(theta)
-    v = np.sin(theta)
-    wind_vec = np.array([u, v])
-
-    cartesian_drone_coords = {
-        "x_site": x_site,
-        "y_site": y_site,
-        "x_left": x_left,
-        "y_left": y_left,
-        "x_right": x_right,
-        "y_right": y_right
-    }
-
-    print(f"max distance of cone = {max_dist:.2f} m")
-    print(f"half angle set to {half_angle}º, downwind angle = {downwind_angle:.2f}º")
-    print(f"mathematical theta = {np.degrees(theta):.2f}º")
-    print()
-
-    return cartesian_drone_coords
